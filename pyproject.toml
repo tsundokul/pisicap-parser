@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "pisicap-parser"
+version = "0.1.0"
+description = ""
+authors = ["tsundokul <timofte17daniel@gmail.com>"]
+license = "GPLv3"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+orjson = "^3.9.10"
+glom = "^23.5.0"
+elasticsearch = "^7.9.0"
+rich = "^13.7.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
