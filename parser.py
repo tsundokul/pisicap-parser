@@ -3,11 +3,11 @@ import argparse
 import glom
 import logging
 import orjson
-import pisicap
 import re
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from elasticsearch import Elasticsearch
+from pisicap import api, utils
 from rich import progress as prog
 
 
@@ -16,9 +16,7 @@ class Parser:
         self.opt = user_options
         self.es_client = Elasticsearch(self.opt["es_host"] or os.environ["ES_HOST"])
         self.log = self._make_logger()
-        self.api = pisicap.api.SICAP(
-            secure=self.opt["secure"], verbose=self.opt["verbose"]
-        )
+        self.api = api.SICAP(secure=self.opt["secure"], verbose=self.opt["verbose"])
 
     def main(self):
         raise NotImplementedError()
@@ -91,13 +89,16 @@ class ParserCAN(Parser):
 
     def get_notices_list(self) -> dict:
         options = {"pageSize": 3000}
+
         if self.opt.get("date"):
-            options["startPublicationDate"] = self.opt["startDate"]
+            options["startPublicationDate"] = utils.date_parsed(self.opt["date"])
         if self.opt.get("end_date"):
-            options["endPublicationDate"] = self.opt["endDate"]
+            options["startPublicationDate"] = utils.date_parsed(self.opt["end_date"])
 
         response = self.api.getCANoticeList(options)
-        return orjson.loads(response.text)
+        notices_list = orjson.loads(response.text)
+        assert notices_list["searchTooLong"] is False
+        return notices_list
 
     def get_notice(self, id_anunt: int) -> dict:
         response = self.api.getCANotice(id_anunt)
@@ -286,14 +287,52 @@ class ParserCAN(Parser):
         return self._upsert_es_doc(es_doc, item["caNoticeId"])
 
 
-# Prior information notices
-class ParserPIN(Parser):
+# Unawarded Contract Notices
+class ParserUCA(Parser):
     def __init__(self, user_options: dict = {}) -> None:
         if "es_index" not in user_options:
             user_options["es_index"] = "licitatii-deschise"
 
         super().__init__(user_options)
-        self.log.info("Prior Information Notices mode")
+        self.log.info("Unawarded Contract Notices mode")
+
+    def main(self):
+        self.parse_notices()
+
+    def parse_notices(self):
+        notices = self.get_notices_list()
+
+    def get_notices_list(self):
+        start_time = utils.date_parsed(self.opt.get("date") or "2020-01-01", True)
+        end_time = utils.date_parsed(self.opt.get("date") or str(utils.now()), True)
+        tmp_time = start_time + utils.DELTA_6MONTHS
+
+        options = {
+            "pageSize": 3000,
+            "startPublicationDate": utils.date_iso(start_time),
+            "endPublicationDate": utils.date_iso(end_time),
+        }
+
+        if tmp_time < end_time:
+            options["endPublicationDate"] = utils.date_iso(tmp_time)
+
+        items = []
+
+        while True:
+            response = self.api.getCNoticeList(options)
+            notices = orjson.loads(response.text)
+            assert notices["searchTooLong"] is False
+
+            items += notices['items']
+
+            if tmp_time >= end_time:
+                break
+
+            options["startPublicationDate"] = options["endPublicationDate"]
+            tmp_time += utils.DELTA_6MONTHS
+            options["endPublicationDate"] = utils.date_iso(tmp_time)
+
+        return items
 
 
 def parse_cli_args():
@@ -313,8 +352,8 @@ def parse_cli_args():
         "-m",
         "--mode",
         required=True,
-        choices=["CAN", "PIN"],
-        help="CAN (Contract Award Notices), PIN(Prior Information Notices)",
+        choices=["CAN", "UCA"],
+        help="CAN (Contract Award Notices), UCA (Unawarded Contract Notices)",
     )
 
     args = parser.parse_args()
