@@ -77,6 +77,31 @@ class Parser:
 
         return logger
 
+    def _clean_entity(self, entity: dict) -> None:
+        for key in [
+            "countryId",
+            "cityItem",
+            "numericFiscalNumber",
+            "address",
+            "phone",
+            "fax",
+            "email",
+            "url",
+            "country",
+            "postalCode",
+            "bankAccount",
+            "bankName",
+            "sysEntityTypeId",
+            "sysNoticeEntityAddressType",
+        ]:
+            glom.delete(entity, key, ignore_missing=True)
+
+        glom.assign(
+            entity,
+            "fiscalNumberInt",
+            self._clean_fiscal_code(entity.get("fiscalNumber")),
+        )
+
 
 # CAN stands for Contract Award Notices
 class ParserCAN(Parser):
@@ -323,7 +348,7 @@ class ParserUCA(Parser):
             notices = orjson.loads(response.text)
             assert notices["searchTooLong"] is False
 
-            items += notices['items']
+            items += notices["items"]
 
             if tmp_time >= end_time:
                 break
@@ -333,6 +358,81 @@ class ParserUCA(Parser):
             options["endPublicationDate"] = utils.date_iso(tmp_time)
 
         return items
+
+
+# Direct Aquisitions Award Notices
+class ParserDAAN(Parser):
+    def __init__(self, user_options: dict = {}) -> None:
+        if "es_index" not in user_options:
+            user_options["es_index"] = "achizitii-offline"
+
+        super().__init__(user_options)
+        self.log.info("Direct Aquisitions Award Notices mode")
+
+    def main(self):
+        self.parse_notices()
+
+    def parse_notices(self):
+        notices = self.get_notices_list()
+        self.log.info(f"Total notices to fetch: {len(notices)}")
+        return self._multithread_run(self.add_notice, notices)
+
+    def add_notice(self, notice_id: int):
+        notice = self.get_notice(notice_id)
+        ca_entity = self.get_ca_entity(notice["contractingAuthorityID"])
+        su_entity = self.get_su_entity(notice["supplierID"])
+
+        es_doc = {
+            "notice": notice,
+            "authority": ca_entity,
+            "supplier": su_entity,
+        }
+        return self._upsert_es_doc(es_doc, notice_id)
+
+    def get_notices_list(self) -> set:
+        options = {"pageSize": 2000}
+
+        start_date = utils.date_parsed(self.opt.get("date") or utils.yesterday(), 1)
+        end_date = (
+            utils.date_parsed(self.opt["end_date"], 1)
+            if self.opt.get("end_date")
+            else utils.now()
+        )
+        tmp_date = start_date
+        items = set()
+
+        while end_date > tmp_date:
+            options["publicationDateStart"] = utils.date_iso(tmp_date)
+            tmp_date += utils.DELTA_1H
+            options["publicationDateEnd"] = utils.date_iso(tmp_date)
+
+            response = self.api.getDaAwardNoticeList(options)
+            notices = orjson.loads(response.text)
+
+            items.update(i["daAwardNoticeId"] for i in notices["items"])
+
+        return items
+
+    def get_notice(self, notice_id: int) -> dict:
+        response = self.api.getPublicDAAwardNotice(notice_id)
+        notice = orjson.loads(response.text)
+        self.__clean_notice(notice)
+        return notice
+
+    def get_ca_entity(self, entity_id: int) -> dict:
+        response = self.api.getCAEntityView(entity_id)
+        entity = orjson.loads(response.text)
+        self._clean_entity(entity)
+        return entity
+
+    def get_su_entity(self, entity_id: int) -> dict:
+        response = self.api.getSUEntityView(entity_id)
+        entity = orjson.loads(response.text)
+        self._clean_entity(entity)
+        return entity
+
+    def __clean_notice(self, notice: dict) -> None:
+        glom.delete(notice, "noticeEntityAddress", ignore_missing=True)
 
 
 def parse_cli_args():
@@ -352,8 +452,12 @@ def parse_cli_args():
         "-m",
         "--mode",
         required=True,
-        choices=["CAN", "UCA"],
-        help="CAN (Contract Award Notices), UCA (Unawarded Contract Notices)",
+        choices=["CAN", "UCA", "DAAN"],
+        help="""
+        CAN (Contract Award Notices)
+        UCA (Unawarded Contract Notices)
+        DAAN (Direct Aquisitions Award Notices)
+        """,
     )
 
     args = parser.parse_args()
