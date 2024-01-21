@@ -374,10 +374,7 @@ class ParserDAAN(Parser):
         self.parse_notices()
 
     def parse_notices(self):
-        # notices = self.get_notices_list()
-        with open('/home/tim/Downloads/redownload.json', 'rb') as f:
-            notices = orjson.loads(f.read())
-
+        notices = self.get_notices_list()
         self.log.info(f"Total notices to fetch: {len(notices)}")
         return self._multithread_run(self.add_notice, notices)
 
