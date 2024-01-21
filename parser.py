@@ -23,13 +23,14 @@ class Parser:
 
     @staticmethod
     def _string_to_int(text: str) -> str:
-        return int(re.sub(r"\D", "", text, flags=re.IGNORECASE))
+        digits = re.sub(r"\D", "", text, flags=re.IGNORECASE)
+        return int(digits) if digits else None
 
     def _clean_fiscal_code(self, code: str) -> int:
         if not isinstance(code, str):
             code = "0"
 
-        return self._string_to_int(code)
+        return self._string_to_int(code) or 0
 
     def _multithread_run(self, task, args_iter):
         results = []
@@ -373,14 +374,22 @@ class ParserDAAN(Parser):
         self.parse_notices()
 
     def parse_notices(self):
-        notices = self.get_notices_list()
+        # notices = self.get_notices_list()
+        with open('/home/tim/Downloads/redownload.json', 'rb') as f:
+            notices = orjson.loads(f.read())
+
         self.log.info(f"Total notices to fetch: {len(notices)}")
         return self._multithread_run(self.add_notice, notices)
 
     def add_notice(self, notice_id: int):
         notice = self.get_notice(notice_id)
         ca_entity = self.get_ca_entity(notice["contractingAuthorityID"])
-        su_entity = self.get_su_entity(notice["supplierID"])
+        su_entity = (
+            self.get_su_entity(notice["supplierID"])
+            if notice["supplierID"]
+            else self.su_entity_fallback(notice["noticeEntityAddress"])
+        )
+        self.__clean_notice(notice)
 
         es_doc = {
             "notice": notice,
@@ -416,7 +425,6 @@ class ParserDAAN(Parser):
     def get_notice(self, notice_id: int) -> dict:
         response = self.api.getPublicDAAwardNotice(notice_id)
         notice = orjson.loads(response.text)
-        self.__clean_notice(notice)
         return notice
 
     def get_ca_entity(self, entity_id: int) -> dict:
@@ -431,9 +439,34 @@ class ParserDAAN(Parser):
         self._clean_entity(entity)
         return entity
 
+    def su_entity_fallback(self, eaddr: dict) -> dict:
+        return {
+            "city": eaddr["city"],
+            "county": None,
+            "entityId": eaddr["noticeEntityAddressID"],
+            "entityName": eaddr["organization"],
+            "fiscalNumber": eaddr["fiscalNumber"],
+            "fiscalNumberInt": self._clean_fiscal_code(eaddr["fiscalNumber"]),
+        }
+
     def __clean_notice(self, notice: dict) -> None:
         glom.delete(notice, "noticeEntityAddress", ignore_missing=True)
 
+
+# Direct Aquisitions Award Notices
+class ParserDA(Parser):
+    def __init__(self, user_options: dict = {}) -> None:
+        if "es_index" not in user_options:
+            user_options["es_index"] = "achizitii-directe"
+
+        super().__init__(user_options)
+        self.log.info("Direct Aquisitions mode")
+
+    def main(self):
+        self.parse_notices()
+
+    def parse_notices(self):
+        pass
 
 def parse_cli_args():
     parser = argparse.ArgumentParser(
@@ -452,11 +485,12 @@ def parse_cli_args():
         "-m",
         "--mode",
         required=True,
-        choices=["CAN", "UCA", "DAAN"],
+        choices=["CAN", "UCA", "DAAN", "DA"],
         help="""
         CAN (Contract Award Notices)
         UCA (Unawarded Contract Notices)
-        DAAN (Direct Aquisitions Award Notices)
+        DAAN (Direct Aquisitions Award Notices / Offline)
+        DA (Direct Aquisitions)
         """,
     )
 
