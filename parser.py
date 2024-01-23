@@ -55,9 +55,9 @@ class Parser:
 
         return results
 
-    def _upsert_es_doc(self, doc, doc_id):
+    def _upsert_es_doc(self, doc, doc_id, index=None):
         return self.es_client.update(
-            index=self.opt["es_index"],
+            index=(index or self.opt["es_index"]),
             id=doc_id,
             doc=doc,
             doc_as_upsert=True,
@@ -102,6 +102,42 @@ class Parser:
             "fiscalNumberInt",
             self._clean_fiscal_code(entity.get("fiscalNumber")),
         )
+
+    def get_ca_entity(self, entity_id: int) -> dict:
+        if (cached := self._get_entity_from_es('ca', entity_id)):
+            return cached
+
+        response = self.api.getCAEntityView(entity_id)
+        entity = orjson.loads(response.text)
+        self._clean_entity(entity)
+        self._insert_entity_to_es(entity, 'ca', entity_id)
+        return entity
+
+    def get_su_entity(self, entity_id: int) -> dict:
+        if (cached := self._get_entity_from_es('su', entity_id)):
+            return cached
+
+        response = self.api.getSUEntityView(entity_id)
+        entity = orjson.loads(response.text)
+        self._clean_entity(entity)
+        self._insert_entity_to_es(entity, 'su', entity_id)
+        return entity
+
+    def _insert_entity_to_es(self, entity, ent_type, ent_id):
+        # keeping the original index names for compatibility
+        indexes = { 'ca': 'autoritati', 'su': 'firme' }
+        doc = { "data": entity, "isNew": True, "updatedAt": utils.now() }
+        self._upsert_es_doc(doc, ent_id, indexes[ent_type])
+
+    def _get_entity_from_es(self, ent_type: str, ent_id):
+        # keeping the original index names for compatibility
+        indexes = { 'ca': 'autoritati', 'su': 'firme' }
+        resp = None
+        try:
+            raw = dict(self.es_client.get(index=indexes[ent_type], id=ent_id))
+            resp = glom.glom(raw, '_source.data', ignore_missing=True)
+        finally:
+            return resp
 
 
 # CAN stands for Contract Award Notices
@@ -329,7 +365,7 @@ class ParserUCA(Parser):
         notices = self.get_notices_list()
 
     def get_notices_list(self):
-        start_time = utils.date_parsed(self.opt.get("date") or "2020-01-01", True)
+        start_time = utils.date_parsed(self.opt.get("date") or utils.yesterday(), True)
         end_time = utils.date_parsed(self.opt.get("date") or str(utils.now()), True)
         tmp_time = start_time + utils.DELTA_6MONTHS
 
@@ -424,18 +460,6 @@ class ParserDAAN(Parser):
         notice = orjson.loads(response.text)
         return notice
 
-    def get_ca_entity(self, entity_id: int) -> dict:
-        response = self.api.getCAEntityView(entity_id)
-        entity = orjson.loads(response.text)
-        self._clean_entity(entity)
-        return entity
-
-    def get_su_entity(self, entity_id: int) -> dict:
-        response = self.api.getSUEntityView(entity_id)
-        entity = orjson.loads(response.text)
-        self._clean_entity(entity)
-        return entity
-
     def su_entity_fallback(self, eaddr: dict) -> dict:
         return {
             "city": eaddr["city"],
@@ -450,7 +474,7 @@ class ParserDAAN(Parser):
         glom.delete(notice, "noticeEntityAddress", ignore_missing=True)
 
 
-# Direct Aquisitions Award Notices
+# Direct Aquisitions
 class ParserDA(Parser):
     def __init__(self, user_options: dict = {}) -> None:
         if "es_index" not in user_options:
@@ -460,10 +484,59 @@ class ParserDA(Parser):
         self.log.info("Direct Aquisitions mode")
 
     def main(self):
-        self.parse_notices()
+        return self.parse_notices()
 
     def parse_notices(self):
-        pass
+        items = self.get_notices_list()
+        return self._multithread_run(self.add_direct_acquisition, items)
+
+    def get_notices_list(self) -> list:
+        options = {}
+
+        if self.opt.get("date"):
+            options["finalizationDateStart"] = utils.date_parsed(self.opt["date"])
+        if self.opt.get("end_date"):
+            options["finalizationDateEnd"] = utils.date_parsed(self.opt["end_date"])
+
+        def notices_per_cpv(cpv):
+            opt = options.copy()
+            opt["cpvCodeId"] = cpv
+            response = self.api.getDirectAcquisitionList(opt)
+            notices = orjson.loads(response.text)
+            if notices["searchTooLong"]:
+                self.log.warn("DA [searchTooLong]: CPV {cpv}")
+
+            return notices["items"]
+
+        notices = []
+        for item_list in self._multithread_run(notices_per_cpv, self.api.cpvs().keys()):
+            notices.extend(item_list)
+
+        return notices
+
+    def add_direct_acquisition(self, item):
+        da = self.get_da(item["directAcquisitionId"])
+        self.__clean_da(da)
+        authority = self.get_ca_entity(da["contractingAuthorityID"])
+        supplier = self.get_su_entity(da["supplierId"])
+
+        es_doc = {
+            "item": item,
+            "publicDirectAcquisition": da,
+            "authority": authority,
+            "supplier": supplier,
+            "istoric": False,
+        }
+        return self._upsert_es_doc(es_doc, item["directAcquisitionId"])
+
+    def get_da(self, notice_id):
+        response = self.api.getPublicDirectAcquisition(notice_id)
+        return orjson.loads(response.text)
+
+    def __clean_da(self, da) -> None:
+        for item in glom.glom(da, "directAcquisitionItems"):
+            glom.delete(item, "assignedUserEmail", ignore_missing=True)
+
 
 def parse_cli_args():
     parser = argparse.ArgumentParser(
