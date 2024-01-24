@@ -6,7 +6,7 @@ import orjson
 import re
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from elasticsearch import Elasticsearch
+from elasticsearch import Elasticsearch, ConflictError
 from pisicap import api, utils
 from rich import progress as prog
 
@@ -127,10 +127,13 @@ class Parser:
         # keeping the original index names for compatibility
         indexes = { 'ca': 'autoritati', 'su': 'firme' }
         doc = { "data": entity, "isNew": True, "updatedAt": utils.now() }
-        self._upsert_es_doc(doc, ent_id, indexes[ent_type])
+        try:
+            self._upsert_es_doc(doc, ent_id, indexes[ent_type])
+        except ConflictError:
+            # occurs when updating same doc by multiple threads
+            pass
 
     def _get_entity_from_es(self, ent_type: str, ent_id):
-        # keeping the original index names for compatibility
         indexes = { 'ca': 'autoritati', 'su': 'firme' }
         resp = None
         try:
@@ -504,7 +507,7 @@ class ParserDA(Parser):
             response = self.api.getDirectAcquisitionList(opt)
             notices = orjson.loads(response.text)
             if notices["searchTooLong"]:
-                self.log.warn("DA [searchTooLong]: CPV {cpv}")
+                self.log.warning("DA [searchTooLong]: CPV {cpv}")
 
             return notices["items"]
 
@@ -572,6 +575,7 @@ if __name__ == "__main__":
     """TODO:
     - move the classes to separate files
     - add retry mechanism for failed requests
+    - add api key auth for elastic
     """
     args = parse_cli_args()
     parser_class = globals()[f"Parser{args['mode']}"]
