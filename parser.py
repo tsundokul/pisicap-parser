@@ -6,9 +6,18 @@ import orjson
 import re
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from elasticsearch import Elasticsearch, ConflictError
+from elasticsearch import Elasticsearch, ConflictError, NotFoundError
 from pisicap import api, utils
 from rich import progress as prog
+from tenacity import retry_if_result, stop_after_attempt, wait_fixed
+
+
+class customSICAP(api.SICAP):
+    retry_rules = dict(
+        retry=retry_if_result(utils.not_200),
+        stop=stop_after_attempt(5),
+        wait=wait_fixed(5),
+    )
 
 
 class Parser:
@@ -16,7 +25,7 @@ class Parser:
         self.opt = user_options
         self.es_client = Elasticsearch(self.opt["es_host"] or os.environ["ES_HOST"])
         self.log = self._make_logger()
-        self.api = api.SICAP(secure=self.opt["secure"], verbose=self.opt["verbose"])
+        self.api = customSICAP(secure=self.opt["secure"], verbose=self.opt["verbose"])
 
     def main(self):
         raise NotImplementedError()
@@ -104,29 +113,29 @@ class Parser:
         )
 
     def get_ca_entity(self, entity_id: int) -> dict:
-        if (cached := self._get_entity_from_es('ca', entity_id)):
+        if cached := self._get_entity_from_es("ca", entity_id):
             return cached
 
         response = self.api.getCAEntityView(entity_id)
         entity = orjson.loads(response.text)
         self._clean_entity(entity)
-        self._insert_entity_to_es(entity, 'ca', entity_id)
+        self._insert_entity_to_es(entity, "ca", entity_id)
         return entity
 
     def get_su_entity(self, entity_id: int) -> dict:
-        if (cached := self._get_entity_from_es('su', entity_id)):
+        if cached := self._get_entity_from_es("su", entity_id):
             return cached
 
         response = self.api.getSUEntityView(entity_id)
         entity = orjson.loads(response.text)
         self._clean_entity(entity)
-        self._insert_entity_to_es(entity, 'su', entity_id)
+        self._insert_entity_to_es(entity, "su", entity_id)
         return entity
 
     def _insert_entity_to_es(self, entity, ent_type, ent_id):
         # keeping the original index names for compatibility
-        indexes = { 'ca': 'autoritati', 'su': 'firme' }
-        doc = { "data": entity, "isNew": True, "updatedAt": utils.now() }
+        indexes = {"ca": "autoritati", "su": "firme"}
+        doc = {"data": entity, "isNew": True, "updatedAt": utils.now()}
         try:
             self._upsert_es_doc(doc, ent_id, indexes[ent_type])
         except ConflictError:
@@ -134,11 +143,11 @@ class Parser:
             pass
 
     def _get_entity_from_es(self, ent_type: str, ent_id):
-        indexes = { 'ca': 'autoritati', 'su': 'firme' }
+        indexes = {"ca": "autoritati", "su": "firme"}
         resp = None
         try:
             raw = dict(self.es_client.get(index=indexes[ent_type], id=ent_id))
-            resp = glom.glom(raw, '_source.data', ignore_missing=True)
+            resp = glom.glom(raw, "_source.data")
         finally:
             return resp
 
@@ -365,15 +374,93 @@ class ParserUCA(Parser):
         self.parse_notices()
 
     def parse_notices(self):
-        notices = self.get_notices_list()
+        notices_ids = set([n["procedureId"] for n in self.get_notices_list()])
+        cached_unawarded_ids = self.get_cached_unawarded()
+
+        return self._multithread_run(
+            self.add_notice, notices_ids | cached_unawarded_ids
+        )
+
+    def add_notice(self, notice_id: int):
+        if not (notice := self.get_notice(notice_id)):
+            return
+
+        time_now = utils.now()
+        notice_clean = {"procedureId": notice_id, "added": time_now}
+
+        for key in [
+            "typeNoticeId",
+            "header.contractName",
+            "header.sysNoticeType.id",
+            "header.noticePublicationDate",
+            "header.estimatedValue",
+            "header.contractingAuthorityName",
+            "header.contractingAuthorityId",
+            "phaseInfo.sysProcedurePhaseId",
+        ]:
+            notice_clean[key] = glom.glom(notice, key, default=None)
+
+        suppliers = []
+        modified = False
+
+        for s in notice["participantSuppliers"] or []:
+            entity = self.get_su_entity(s["participantId"])
+            entity["isWinner"] = s["isWinner"]
+            entity["participantState"] = s["participantState"]["text"]
+            entity["date_added"] = time_now
+            suppliers.append(entity)
+
+        if cached := self.get_cached_notice(notice_id):
+            if (
+                cached["notice"]["phaseInfo.sysProcedurePhaseId"]
+                != notice_clean["phaseInfo.sysProcedurePhaseId"]
+            ):
+                modified = True
+
+            cached["notice"].update(notice_clean)
+            cached_supp = [s["entityId"] for s in cached["suppliers"]]
+
+            # Add only new suppliers and update "isWinner" flag
+            for supp in suppliers:
+                if supp["entityId"] not in cached_supp:
+                    cached["suppliers"].append(supp)
+                    modified = True
+                else:
+                    for csupp in cached["suppliers"]:
+                        if csupp["entityId"] == supp["entityId"]:
+                            csupp["isWinner"] = supp["isWinner"]
+
+            es_doc = cached
+        else:
+            ca_entity = self.get_ca_entity(
+                notice_clean["header.contractingAuthorityId"]
+            )
+
+            es_doc = {
+                "notice": notice_clean,
+                "authority": ca_entity,
+                "suppliers": suppliers,
+            }
+
+        if modified or es_doc["notice"].get("modified") is None:
+            es_doc["notice"]["modified"] = time_now
+
+        return self._upsert_es_doc(es_doc, notice_id)
+
+    def get_notice(self, notice_id: int) -> dict:
+        response = self.api.getProcedureView(notice_id)
+        notice = orjson.loads(response.text)
+        return notice
 
     def get_notices_list(self):
         start_time = utils.date_parsed(self.opt.get("date") or utils.yesterday(), True)
-        end_time = utils.date_parsed(self.opt.get("date") or str(utils.now()), True)
+        end_time = utils.date_parsed(self.opt.get("end_date") or str(utils.now()), True)
         tmp_time = start_time + utils.DELTA_6MONTHS
 
         options = {
-            "pageSize": 3000,
+            "sysNoticeTypeIds": [2, 6, 7, 17],
+            "pageSize": 5000,
+            "sysProcedureStateId": 2,
             "startPublicationDate": utils.date_iso(start_time),
             "endPublicationDate": utils.date_iso(end_time),
         }
@@ -398,6 +485,28 @@ class ParserUCA(Parser):
             options["endPublicationDate"] = utils.date_iso(tmp_time)
 
         return items
+
+    def get_cached_notice(self, notice_id: int) -> dict | None:
+        try:
+            resp = self.es_client.get(index=self.opt["es_index"], id=notice_id)
+            return resp["_source"]
+        except NotFoundError:
+            pass
+
+    def get_cached_unawarded(self) -> list:
+        """{ 2: "Depunere ofertă", 3: "Evaluare calificare si tehnica", 11: "Evaluare financiara", 4: "Deliberare", 5: "Atribuita" }"""
+        resp = self.es_client.search(
+            index=self.opt["es_index"],
+            stored_fields="_id",
+            size=10000,
+            query={
+                "bool": {
+                    "must_not": {"match": {"notice.phaseInfo.sysProcedurePhaseId": 5}}
+                }
+            },
+        )
+
+        return set([int(hit["_id"]) for hit in resp["hits"]["hits"]])
 
 
 # Direct Aquisitions Award Notices
@@ -571,13 +680,17 @@ def parse_cli_args():
     return vars(args)
 
 
-if __name__ == "__main__":
-    """TODO:
-    - move the classes to separate files
-    - add retry mechanism for failed requests
-    - add api key auth for elastic
-    """
+def main():
     args = parse_cli_args()
     parser_class = globals()[f"Parser{args['mode']}"]
     parser = parser_class(args)
     parser.main()
+
+
+if __name__ == "__main__":
+    """TODO:
+    - move the classes to separate files
+    - add option to manually pass notices id (via an input file)
+    - add api key auth for elastic
+    """
+    main()
