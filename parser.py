@@ -403,10 +403,13 @@ class ParserUCA(Parser):
         suppliers = []
         modified = False
 
-        for s in notice["participantSuppliers"] or []:
-            entity = self.get_su_entity(s["participantId"])
-            entity["isWinner"] = s["isWinner"]
-            entity["participantState"] = s["participantState"]["text"]
+        participants = self.get_suppliers(notice_id)
+
+        for part in participants:
+            entity = self.get_su_entity(part['entityId'])
+            entity["isLead"] = part.get("isLead", False)
+            entity['statementSupplierId'] = part['statementSupplierId']
+            entity["participantState"] = glom.glom(part, "sysProcedureSupplierClass.text", default="N/A")
             entity["date_added"] = time_now
             suppliers.append(entity)
 
@@ -420,15 +423,10 @@ class ParserUCA(Parser):
             cached["notice"].update(notice_clean)
             cached_supp = [s["entityId"] for s in cached["suppliers"]]
 
-            # Add only new suppliers and update "isWinner" flag
             for supp in suppliers:
                 if supp["entityId"] not in cached_supp:
                     cached["suppliers"].append(supp)
                     modified = True
-                else:
-                    for csupp in cached["suppliers"]:
-                        if csupp["entityId"] == supp["entityId"]:
-                            csupp["isWinner"] = supp["isWinner"]
 
             es_doc = cached
         else:
@@ -492,6 +490,29 @@ class ParserUCA(Parser):
             return resp["_source"]
         except NotFoundError:
             pass
+
+    def get_suppliers(self, notice_id) -> list:
+        rfq_inv = orjson.loads(self.api.getRfqInvitationView(notice_id).text)
+        proc_id = rfq_inv['procedureId'] if rfq_inv else notice_id
+        proc_rep = orjson.loads(self.api.getProcedureReports(proc_id).text)
+        statement_docs = []
+
+        for doc in proc_rep["items"]:
+            if doc["sysNoticeDocumentType"]["id"] == 10:
+                statement_docs.append(doc["procedureStatementId"])
+
+        if not statement_docs:
+            return []
+
+        proc_stat = orjson.loads(
+            self.api.getProcedureStatementView(statement_docs[0]).text
+        )
+
+        suppliers = []
+        for p in proc_stat["statementSuppliers"]:
+            suppliers.extend(p['statementParticipants'])
+
+        return suppliers
 
     def get_cached_unawarded(self) -> list:
         """{ 2: "Depunere ofertă", 3: "Evaluare calificare si tehnica", 11: "Evaluare financiara", 4: "Deliberare", 5: "Atribuita" }"""
