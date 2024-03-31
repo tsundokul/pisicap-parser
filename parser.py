@@ -516,16 +516,19 @@ class ParserUCA(Parser):
 
     def get_cached_unawarded(self) -> list:
         """{ 2: "Depunere ofertă", 3: "Evaluare calificare si tehnica", 11: "Evaluare financiara", 4: "Deliberare", 5: "Atribuita" }"""
-        resp = self.es_client.search(
-            index=self.opt["es_index"],
-            stored_fields="_id",
-            size=10000,
-            query={
-                "bool": {
-                    "must_not": {"match": {"notice.phaseInfo.sysProcedurePhaseId": 5}}
-                }
-            },
-        )
+        try:
+            resp = self.es_client.search(
+                index=self.opt["es_index"],
+                stored_fields="_id",
+                size=10000,
+                query={
+                    "bool": {
+                        "must_not": {"match": {"notice.phaseInfo.sysProcedurePhaseId": 5}}
+                    }
+                },
+            )
+        except NotFoundError:
+            return set()
 
         return set([int(hit["_id"]) for hit in resp["hits"]["hits"]])
 
