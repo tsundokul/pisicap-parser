@@ -406,7 +406,7 @@ class ParserUCA(Parser):
         participants = self.get_suppliers(notice_id)
 
         for part in participants:
-            entity = self.get_su_entity(part['entityId'])
+            entity = self.get_su_entity(part['entityId']) if part['entityId'] else self._missing_entity_fallback(part)
             entity["isLead"] = part.get("isLead", False)
             entity['statementSupplierId'] = part['statementSupplierId']
             entity["participantState"] = glom.glom(part, "sysProcedureSupplierClass.text", default="N/A")
@@ -492,7 +492,13 @@ class ParserUCA(Parser):
             pass
 
     def get_suppliers(self, notice_id) -> list:
-        rfq_inv = orjson.loads(self.api.getRfqInvitationView(notice_id).text)
+        rfq_resp = self.api.getRfqInvitationView(notice_id)
+        # When access to suppliers is denied
+        if rfq_resp.status_code == 400:
+            self.log.warning(f'Suppliers denied for UCA notice {notice_id}')
+            return []
+
+        rfq_inv = orjson.loads(rfq_resp.text)
         proc_id = rfq_inv['procedureId'] if rfq_inv else notice_id
         proc_rep = orjson.loads(self.api.getProcedureReports(proc_id).text)
         statement_docs = []
@@ -532,6 +538,15 @@ class ParserUCA(Parser):
 
         return set([int(hit["_id"]) for hit in resp["hits"]["hits"]])
 
+    def _missing_entity_fallback(self, participant):
+        return {
+            'entityId': None,
+            'fiscalNumberInt': self._clean_fiscal_code(participant['fiscalNumber']),
+            'entityName': participant['name'],
+            'city': "",
+            'county': "",
+            'fiscalNumber': participant['fiscalNumber'],
+        }
 
 # Direct Aquisitions Award Notices
 class ParserDAAN(Parser):
