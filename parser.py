@@ -3,20 +3,20 @@ import argparse
 import glom
 import logging
 import orjson
-import re
 import os
+import re
+import tenacity
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from elasticsearch import Elasticsearch, ConflictError, NotFoundError
 from pisicap import api, utils
 from rich import progress as prog
-from tenacity import retry_if_result, stop_after_attempt, wait_fixed
 
 
 class customSICAP(api.SICAP):
     retry_rules = dict(
-        retry=retry_if_result(utils.not_200),
-        stop=stop_after_attempt(5),
-        wait=wait_fixed(5),
+        retry=tenacity.retry_if_result(utils.not_200),
+        stop=tenacity.stop_after_attempt(5),
+        wait=tenacity.wait_fixed(5),
     )
 
 
@@ -406,10 +406,16 @@ class ParserUCA(Parser):
         participants = self.get_suppliers(notice_id)
 
         for part in participants:
-            entity = self.get_su_entity(part['entityId']) if part['entityId'] else self._missing_entity_fallback(part)
+            entity = (
+                self.get_su_entity(part["entityId"])
+                if part["entityId"]
+                else self._missing_entity_fallback(part)
+            )
             entity["isLead"] = part.get("isLead", False)
-            entity['statementSupplierId'] = part['statementSupplierId']
-            entity["participantState"] = glom.glom(part, "sysProcedureSupplierClass.text", default="N/A")
+            entity["statementSupplierId"] = part["statementSupplierId"]
+            entity["participantState"] = glom.glom(
+                part, "sysProcedureSupplierClass.text", default="N/A"
+            )
             entity["date_added"] = time_now
             suppliers.append(entity)
 
@@ -492,14 +498,15 @@ class ParserUCA(Parser):
             pass
 
     def get_suppliers(self, notice_id) -> list:
-        rfq_resp = self.api.getRfqInvitationView(notice_id)
+        try:
+            rfq_resp = self.api.getRfqInvitationView(notice_id)
         # When access to suppliers is denied
-        if rfq_resp.status_code == 400:
-            self.log.warning(f'Suppliers denied for UCA notice {notice_id}')
+        except tenacity.RetryError:
+            self.log.warning(f"Suppliers denied for UCA notice {notice_id}")
             return []
 
         rfq_inv = orjson.loads(rfq_resp.text)
-        proc_id = rfq_inv['procedureId'] if rfq_inv else notice_id
+        proc_id = rfq_inv["procedureId"] if rfq_inv else notice_id
         proc_rep = orjson.loads(self.api.getProcedureReports(proc_id).text)
         statement_docs = []
 
@@ -516,7 +523,7 @@ class ParserUCA(Parser):
 
         suppliers = []
         for p in proc_stat["statementSuppliers"]:
-            suppliers.extend(p['statementParticipants'])
+            suppliers.extend(p["statementParticipants"])
 
         return suppliers
 
@@ -529,7 +536,9 @@ class ParserUCA(Parser):
                 size=10000,
                 query={
                     "bool": {
-                        "must_not": {"match": {"notice.phaseInfo.sysProcedurePhaseId": 5}}
+                        "must_not": {
+                            "match": {"notice.phaseInfo.sysProcedurePhaseId": 5}
+                        }
                     }
                 },
             )
@@ -540,13 +549,14 @@ class ParserUCA(Parser):
 
     def _missing_entity_fallback(self, participant):
         return {
-            'entityId': None,
-            'fiscalNumberInt': self._clean_fiscal_code(participant['fiscalNumber']),
-            'entityName': participant['name'],
-            'city': "",
-            'county': "",
-            'fiscalNumber': participant['fiscalNumber'],
+            "entityId": None,
+            "fiscalNumberInt": self._clean_fiscal_code(participant["fiscalNumber"]),
+            "entityName": participant["name"],
+            "city": "",
+            "county": "",
+            "fiscalNumber": participant["fiscalNumber"],
         }
+
 
 # Direct Aquisitions Award Notices
 class ParserDAAN(Parser):
